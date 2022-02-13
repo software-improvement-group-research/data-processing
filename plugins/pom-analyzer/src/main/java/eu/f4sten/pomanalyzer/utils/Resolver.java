@@ -15,26 +15,40 @@
  */
 package eu.f4sten.pomanalyzer.utils;
 
+import static java.lang.String.format;
+import static java.util.stream.IntStream.range;
+import static org.apache.commons.lang3.SystemUtils.IS_OS_WINDOWS;
 import static org.jboss.shrinkwrap.resolver.api.maven.ScopeType.COMPILE;
 import static org.jboss.shrinkwrap.resolver.api.maven.ScopeType.PROVIDED;
 import static org.jboss.shrinkwrap.resolver.api.maven.ScopeType.RUNTIME;
 import static org.jboss.shrinkwrap.resolver.api.maven.ScopeType.SYSTEM;
 
 import java.io.File;
-import java.util.Date;
+import java.nio.channels.FileLockInterruptionException;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 
 import org.jboss.shrinkwrap.resolver.api.maven.Maven;
+import org.jboss.shrinkwrap.resolver.api.maven.repository.MavenChecksumPolicy;
+import org.jboss.shrinkwrap.resolver.api.maven.repository.MavenRemoteRepositories;
+import org.jboss.shrinkwrap.resolver.api.maven.repository.MavenRemoteRepository;
+import org.jboss.shrinkwrap.resolver.api.maven.repository.MavenUpdatePolicy;
 import org.jboss.shrinkwrap.resolver.impl.maven.MavenResolvedArtifactImpl;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import eu.f4sten.pomanalyzer.data.NoArtifactRepositoryException;
 import eu.f4sten.pomanalyzer.data.ResolutionResult;
-import eu.f4sten.pomanalyzer.data.UnresolvablePomFileException;
+import eu.f4sten.pomanalyzer.exceptions.NoArtifactRepositoryException;
+import eu.f4sten.pomanalyzer.exceptions.ResolutionFileLockError;
+import eu.f4sten.pomanalyzer.exceptions.ResolutionTimeoutError;
+import eu.f4sten.pomanalyzer.exceptions.UnresolvablePomFileException;
 
 public class Resolver {
 
@@ -42,23 +56,52 @@ public class Resolver {
     // to avoid unnecessary downloads on every build. Make sure to re-enable the
     // tests and run them locally for every change in this class.
 
-    public static final Logger LOG = LoggerFactory.getLogger(Resolver.class);
+    private static final Logger LOG = LoggerFactory.getLogger(Resolver.class);
+    private static final int RESOLUTION_TIMEOUT_MS = 1000 * 60 * 5; // 5min
 
-    public Set<ResolutionResult> resolveDependenciesFromPom(File pom) {
+    public Set<ResolutionResult> resolveDependenciesFromPom(File pom, String artifactRepository) {
         var coordToResult = new HashMap<String, ResolutionResult>();
 
-        resolvePom(pom).forEach(res -> {
-            if (res.artifactRepository.startsWith("http")) {
-                coordToResult.put(res.coordinate, res);
-                return;
-            }
-            throw new NoArtifactRepositoryException(res.coordinate);
+        runWithTimeout(pom, artifactRepository, () -> {
+
+            // two iterations: 0) resolving and (potential) deletion 1) get artifactRepos
+            range(0, 2).forEach(i -> {
+                resolvePom(pom, artifactRepository).forEach(res -> {
+                    // ignore known dependencies or those that should be skipped (e.g., exist in DB)
+                    if (coordToResult.containsKey(res.coordinate)) {
+                        return;
+                    }
+
+                    // remember identified artifactRepository
+                    if (res.artifactRepository.startsWith("http")) {
+                        coordToResult.put(res.coordinate, res);
+                        return;
+                    }
+
+                    // some packages lack information about the artifact repository in the .m2
+                    // folder, caused byold Maven tools and FileLockExceptions in multi-threaded
+                    // executions. This can be recovered through deletion and retry.
+                    File f = res.getLocalPackageFile();
+                    if (i == 0 && f.exists() && f.isFile()) {
+                        LOG.info("Deleting local package to enforce repository discovery on re-download: {}",
+                                res.coordinate);
+                        f.delete();
+                    } else {
+                        // deletion "on-the-fly" does not work on windows
+                        if (IS_OS_WINDOWS) {
+                            LOG.error("Cannot find artifactRepository for {}.", res.coordinate);
+                        } else {
+                            throw new NoArtifactRepositoryException(res.coordinate);
+                        }
+                    }
+                });
+            });
         });
 
         return new HashSet<>(coordToResult.values());
     }
 
-    private static Set<ResolutionResult> resolvePom(File f) {
+    private static Set<ResolutionResult> resolvePom(File f, String artifactRepository) {
         var res = new HashSet<String[]>();
         try {
             MavenResolvedArtifactImpl.artifactRepositories = res;
@@ -95,14 +138,15 @@ public class Resolver {
             return;
         }
         LOG.info("Resolving/downloading POM file that does not exist in .m2 folder ...");
-        resolvePom(artifact);
+        runWithTimeout(artifact.localPomFile, artifact.artifactRepository, () -> {
+            resolvePom(artifact);
+        });
         if (!artifact.localPomFile.exists()) {
             throw new UnresolvablePomFileException(artifact.toString());
         }
     }
 
     private void resolvePom(ResolutionResult artifact) {
-        var repoName = String.format("%s.%d", Resolver.class.getName(), new Date().getTime());
         Maven.configureResolver() //
                 .withClassPathResolution(false) //
                 .withRemoteRepo(getRepo(artifact.artifactRepository)) //
@@ -121,5 +165,38 @@ public class Resolver {
     private static String getRepoName(String url) {
         var simplifiedUrl = url.replaceAll("[^a-zA-Z0-9-]+", "");
         return format("%s-%s", Resolver.class.getName(), simplifiedUrl);
+    }
+
+    private static final ExecutorService EXEC = Executors.newSingleThreadExecutor();
+
+    private static void runWithTimeout(File f, String repo, Runnable task) {
+
+        var future = EXEC.submit(() -> {
+//            try {
+//                Thread.sleep(1000);
+//            } catch (InterruptedException e) {
+//                Thread.currentThread().interrupt();
+//            }
+            task.run();
+        });
+
+        try {
+            future.get(RESOLUTION_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            var msg = "Resolution timeout after %dms: %s (%s)";
+            throw new ResolutionTimeoutError(format(msg, RESOLUTION_TIMEOUT_MS, f.getAbsolutePath(), repo));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (ExecutionException e) {
+            var cause = e.getCause();
+            if (cause instanceof FileLockInterruptionException) {
+                var msg = "Resolution failed for %s (%s)";
+                throw new ResolutionFileLockError(format(msg, f.getAbsolutePath(), repo), cause);
+            } else if (cause instanceof RuntimeException) {
+                throw (RuntimeException) cause;
+            } else {
+                throw new RuntimeException(cause);
+            }
+        }
     }
 }
