@@ -21,6 +21,7 @@ import static eu.f4sten.infra.kafka.Lane.PRIORITY;
 import static java.time.Duration.ZERO;
 
 import java.time.Duration;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
@@ -31,9 +32,11 @@ import java.util.function.Function;
 
 import javax.inject.Inject;
 
+import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.TopicPartition;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -106,11 +109,11 @@ public class KafkaImpl implements Kafka {
         }
 
         subsNorm.add(combine(topic, NORMAL));
-        connNorm.subscribe(subsNorm);
+        connNorm.subscribe(subsNorm, new MyConsumerRebalanceListener("normal", connNorm));
         LOG.debug("Subscribed ({}): {}", NORMAL, subsNorm);
 
         subsPrio.add(combine(topic, PRIORITY));
-        connPrio.subscribe(subsPrio);
+        connPrio.subscribe(subsPrio, new MyConsumerRebalanceListener("prio", connPrio));
         LOG.debug("Subscribed ({}): {}", PRIORITY, subsPrio);
     }
 
@@ -216,6 +219,34 @@ public class KafkaImpl implements Kafka {
                     publish(err, baseTopic, ERROR);
                 }
             }
+        }
+    }
+
+    public static class MyConsumerRebalanceListener implements ConsumerRebalanceListener {
+
+        private String name;
+
+        public MyConsumerRebalanceListener(String name, KafkaConsumer<String, String> conn) {
+            this.name = name;
+        }
+
+        private void log(String method) {
+            LOG.info("Listener invocation for connection '{}': MyConsumerRebalanceListener.{}", name, method);
+        }
+
+        @Override
+        public void onPartitionsRevoked(Collection<TopicPartition> partitions) {
+            log("onPartitionsRevoked");
+        }
+
+        @Override
+        public void onPartitionsAssigned(Collection<TopicPartition> partitions) {
+            log("onPartitionsAssigned");
+        }
+
+        @Override
+        public void onPartitionsLost(Collection<TopicPartition> partitions) {
+            log("onPartitionsLost");
         }
     }
 }
