@@ -37,6 +37,7 @@ import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.WakeupException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -79,6 +80,15 @@ public class KafkaImpl implements Kafka {
     public void sendHeartbeat() {
         sendHeartBeat(connNorm);
         sendHeartBeat(connPrio);
+    }
+
+    @Override
+    public void stop() {
+        connNorm.wakeup();
+        connNorm.close();
+        connPrio.wakeup();
+        connPrio.close();
+        producer.close();
     }
 
     @Override
@@ -157,16 +167,20 @@ public class KafkaImpl implements Kafka {
     private boolean process(KafkaConsumer<String, String> con, Lane lane, Duration timeout) {
         LOG.debug("Sending heartbeat ...");
         hadMessages = false;
-        for (var r : con.poll(timeout)) {
-            LOG.debug("Received message on ('combined') topic {}, invoking callbacks ...", r.topic());
-            hadMessages = true;
-            var json = r.value();
-            Set<Callback<?>> cbs = callbacks.get(r.topic());
-            for (var cb : cbs) {
-                cb.exec(r.topic(), json, lane);
+        try {
+            for (var r : con.poll(timeout)) {
+                LOG.debug("Received message on ('combined') topic {}, invoking callbacks ...", r.topic());
+                hadMessages = true;
+                var json = r.value();
+                Set<Callback<?>> cbs = callbacks.get(r.topic());
+                for (var cb : cbs) {
+                    cb.exec(r.topic(), json, lane);
+                }
             }
+            con.commitSync();
+        } catch (WakeupException e) {
+            // used by Kafka to interrupt long polls, can be ignored
         }
-        con.commitSync();
         return hadMessages;
     }
 
