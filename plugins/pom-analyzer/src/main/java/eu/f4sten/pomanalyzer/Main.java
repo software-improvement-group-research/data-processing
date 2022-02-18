@@ -19,13 +19,21 @@ import static eu.f4sten.infra.kafka.Lane.NORMAL;
 import static eu.f4sten.infra.kafka.Lane.PRIORITY;
 import static java.lang.String.format;
 
+import java.nio.channels.FileLockInterruptionException;
 import java.time.Duration;
 import java.util.Date;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import javax.inject.Inject;
 
+import org.apache.commons.lang3.tuple.Pair;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -37,6 +45,8 @@ import eu.f4sten.infra.kafka.MessageGenerator;
 import eu.f4sten.pomanalyzer.data.MavenId;
 import eu.f4sten.pomanalyzer.data.PomAnalysisResult;
 import eu.f4sten.pomanalyzer.data.ResolutionResult;
+import eu.f4sten.pomanalyzer.exceptions.ResolutionFileLockError;
+import eu.f4sten.pomanalyzer.exceptions.ResolutionTimeoutError;
 import eu.f4sten.pomanalyzer.utils.DatabaseUtils;
 import eu.f4sten.pomanalyzer.utils.EffectiveModelBuilder;
 import eu.f4sten.pomanalyzer.utils.MavenRepositoryUtils;
@@ -81,25 +91,29 @@ public class Main implements Plugin {
 
     @Override
     public void run() {
-        AssertArgs.assertFor(args)//
-                .notNull(a -> a.kafkaIn, "kafka input topic") //
-                .notNull(a -> a.kafkaOut, "kafka output topic");
+        try {
+            AssertArgs.assertFor(args)//
+                    .notNull(a -> a.kafkaIn, "kafka input topic") //
+                    .notNull(a -> a.kafkaOut, "kafka output topic");
 
-        LOG.info("Subscribing to '{}', will publish in '{}' ...", args.kafkaIn, args.kafkaOut);
-        kafka.subscribe(args.kafkaIn, MavenId.class, (id, lane) -> {
-            curId = id;
+            LOG.info("Subscribing to '{}', will publish in '{}' ...", args.kafkaIn, args.kafkaOut);
+            kafka.subscribe(args.kafkaIn, MavenId.class, (id, lane) -> {
+                curId = id;
 
-            LOG.info("Consuming next record {} ...", id.asCoordinate());
-            LOG.debug("{}", id);
-            var artifact = bootstrapFirstResolutionResultFromInput(id);
-            runAndCatch(artifact, lane, () -> {
-                resolver.resolveIfNotExisting(artifact);
-                process(artifact, lane);
+                LOG.info("Consuming next record {} ...", id.asCoordinate());
+                LOG.debug("{}", id);
+                var artifact = bootstrapFirstResolutionResultFromInput(id);
+                runAndCatch(artifact, lane, () -> {
+                    resolver.resolveIfNotExisting(artifact);
+                    process(artifact, lane);
+                });
             });
-        });
-        while (true) {
-            LOG.debug("Polling ...");
-            kafka.poll();
+            while (true) {
+                LOG.debug("Polling ...");
+                kafka.poll();
+            }
+        } finally {
+            kafka.stop();
         }
     }
 
@@ -140,45 +154,62 @@ public class Main implements Plugin {
         var duration = Duration.between(startedAt.toInstant(), new Date().toInstant());
         var msg = "Processing {} ... (dependency of: {}, started at: {}, duration: {})";
         LOG.info(msg, artifact.coordinate, curId.asCoordinate(), startedAt, duration);
-
         delayExecutionToPreventThrottling();
 
-        var consumedAt = new Date();
-        kafka.sendHeartbeat();
+        var pair = runWithTimeout(artifact, () -> {
 
-        // merge pom with all its parents and resolve properties
-        var m = modelBuilder.buildEffectiveModel(artifact.localPomFile);
+            var consumedAt = new Date();
+            log("send heartbeat", artifact);
+            kafka.sendHeartbeat();
 
-        // extract details
-        var result = extractor.process(m);
-        result.artifactRepository = artifact.artifactRepository;
-        // packaging often bogus, check and possibly fix
-        result.packagingType = fixer.checkPackage(result);
-        result.sourcesUrl = repo.getSourceUrlIfExisting(result);
-        result.releaseDate = repo.getReleaseDate(result);
+            // merge pom with all its parents and resolve properties
+            log("build effective model", artifact);
+            var m = modelBuilder.buildEffectiveModel(artifact.localPomFile);
 
-        store(result, lane, consumedAt);
+            // extract details
+            log("extract details", artifact);
+            var result = extractor.process(m);
+            result.artifactRepository = artifact.artifactRepository;
+            // packaging often bogus, check and possibly fix
+            log("check package for availability and fix it if necessary/possible", artifact);
+            result.packagingType = fixer.checkPackage(result);
+            log("checking for existing of sources url", artifact);
+            result.sourcesUrl = repo.getSourceUrlIfExisting(result);
+            log("requesting release date", artifact);
+            result.releaseDate = repo.getReleaseDate(result);
 
-        // for performance (and to prevent cycles), remember visited coordinates in-mem
-        memMarkAsIngestedPackage(artifact.coordinate, lane);
-        memMarkAsIngestedPackage(result.toCoordinate(), lane);
+            log("storing results", artifact);
+            store(result, lane, consumedAt);
 
-        // resolve dependencies to
-        // 1) have dependencies
-        // 2) identify artifact sources
-        // 3) make sure all dependencies exist in local .m2 folder
-        var deps = resolver.resolveDependenciesFromPom(artifact.localPomFile, artifact.artifactRepository);
+            // for performance (and to prevent cycles), remember visited coordinates in-mem
+            memMarkAsIngestedPackage(artifact.coordinate, lane);
+            memMarkAsIngestedPackage(result.toCoordinate(), lane);
+
+            // resolve dependencies to
+            // 1) have dependencies
+            // 2) identify artifact sources
+            // 3) make sure all dependencies exist in local .m2 folder
+            log("resolve dependencies", artifact);
+            var innerDeps = resolver.resolveDependenciesFromPom(artifact.localPomFile, artifact.artifactRepository);
+            return Pair.of(result, innerDeps);
+        });
 
         // resolution can be different for dependencies, so 'process' them independently
-        deps.forEach(dep -> {
+        log("processing dependencies", artifact);
+        pair.getValue().forEach(dep -> {
             runAndCatch(dep, lane, () -> {
                 process(dep, lane);
             });
         });
 
+        log("marking ingestion in db", artifact);
         // to stay crash resilient, only mark in DB once all deps have been processed
         moveIngestionMarkFromMemToDb(artifact.coordinate, lane);
-        moveIngestionMarkFromMemToDb(result.toCoordinate(), lane);
+        moveIngestionMarkFromMemToDb(pair.getKey().toCoordinate(), lane);
+    }
+
+    private void log(String task, ResolutionResult artifact) {
+        LOG.info("{} ... ({} @ {})", task, artifact.coordinate, artifact.artifactRepository);
     }
 
     private void store(PomAnalysisResult result, Lane lane, Date consumedAt) {
@@ -228,5 +259,36 @@ public class Main implements Plugin {
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    private static final int RESOLUTION_TIMEOUT_MS = 1000 * 60 * 4; // 4min
+
+    private static final ExecutorService EXEC = Executors.newSingleThreadExecutor();
+
+    public static <T> T runWithTimeout(ResolutionResult artifact, Callable<T> task) {
+
+        var future = EXEC.submit(task);
+
+        try {
+            return future.get(RESOLUTION_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            var msg = "Execution timeout after %dms: %s (%s)";
+            throw new ResolutionTimeoutError(
+                    format(msg, RESOLUTION_TIMEOUT_MS, artifact.coordinate, artifact.artifactRepository));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (ExecutionException e) {
+            var cause = e.getCause();
+            if (cause instanceof FileLockInterruptionException) {
+                var msg = "Execution failed for %s (%s)";
+                throw new ResolutionFileLockError(format(msg, artifact.coordinate, artifact.artifactRepository), cause);
+            } else if (cause instanceof RuntimeException) {
+                throw (RuntimeException) cause;
+            } else {
+                throw new RuntimeException(cause);
+            }
+        }
+
+        throw new IllegalStateException();
     }
 }
